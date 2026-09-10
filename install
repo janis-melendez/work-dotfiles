@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# Installs a small, company-safe terminal environment without using GNU Stow.
+
+set -euo pipefail
+
+# --- Defaults ---
+REPOSITORY="https://github.com/janis-melendez/work-dotfiles.git"
+REF=""
+INSTALL_PLUGINS=false
+INSTALL_OPTIONAL_TOOLS=false
+DRY_RUN=false
+FORCE=false
+
+TEMP_ROOT=""
+SOURCE_DIR=""
+CONFIG_HOME=""
+DATA_HOME=""
+STATE_HOME=""
+BACKUP_ROOT=""
+
+# --- Output helpers ---
+print_usage() {
+    cat <<EOF
+Usage: ./install [options]
+
+Installs zsh, tmux, Neovim, git, ripgrep, jq, and fzf. It then copies the work
+configuration files into your home directory. The temporary repository clone is
+removed when the script exits.
+
+Options:
+  --plugins         Install Antidote, Lazy, and declared tmux plugins.
+  --optional-tools  Also install fd (fd-find on Debian/Ubuntu), ag, and zoxide.
+  --force           Back up conflicting configuration before installing.
+  --ref REF         Clone a branch, tag, or commit instead of the default branch.
+  --repo URL        Use a different dotfiles repository.
+  -n, --dry-run     Print commands without changing the machine.
+  -h, --help        Show this help text.
+
+Existing configuration is never overwritten by default. With --force, it is
+moved to ~/.local/state/work-dotfiles/backup/<timestamp>/ first.
+EOF
+}
+
+run() {
+    printf '+ '
+    printf '%q ' "$@"
+    printf '\n'
+
+    if [[ "$DRY_RUN" == false ]]; then
+        "$@"
+    fi
+}
+
+print_script_info() {
+    printf '\n=== Script Info ===\n\n'
+    printf 'Repository: %s\n' "$REPOSITORY"
+    printf 'Ref: %s\n' "${REF:-default branch}"
+    printf 'Plugins: %s\n' "$INSTALL_PLUGINS"
+    printf 'Optional tools: %s\n' "$INSTALL_OPTIONAL_TOOLS"
+    printf 'Dry run: %s\n' "$DRY_RUN"
+}
+
+# --- Package installers ---
+install_required_tools() {
+    if command -v brew >/dev/null 2>&1; then
+        run brew install zsh tmux neovim git ripgrep jq fzf
+    elif command -v apt-get >/dev/null 2>&1; then
+        run sudo apt-get update
+        run sudo apt-get install -y zsh tmux neovim git ripgrep jq fzf
+    elif command -v dnf >/dev/null 2>&1; then
+        run sudo dnf install -y zsh tmux neovim git ripgrep jq fzf
+    elif command -v pacman >/dev/null 2>&1; then
+        run sudo pacman -Sy --needed --noconfirm zsh tmux neovim git ripgrep jq fzf
+    else
+        printf '%s\n' 'Unsupported package manager: install the required work tools manually.' >&2
+        return 1
+    fi
+}
+
+install_optional_tools() {
+    if command -v brew >/dev/null 2>&1; then
+        run brew install fd the_silver_searcher zoxide
+    elif command -v apt-get >/dev/null 2>&1; then
+        run sudo apt-get install -y fd-find silversearcher-ag zoxide
+    elif command -v dnf >/dev/null 2>&1; then
+        run sudo dnf install -y fd-find the_silver_searcher zoxide
+    elif command -v pacman >/dev/null 2>&1; then
+        run sudo pacman -S --needed --noconfirm fd the_silver_searcher zoxide
+    fi
+}
+
+# --- Repository helpers ---
+cleanup() {
+    if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" && "$DRY_RUN" == false ]]; then
+        rm -rf "$TEMP_ROOT"
+    fi
+}
+
+prepare_temporary_clone() {
+    if [[ "$DRY_RUN" == true ]]; then
+        TEMP_ROOT="${TMPDIR:-/tmp}/work-dotfiles.dry-run"
+    else
+        TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/work-dotfiles.XXXXXXXX")"
+    fi
+
+    SOURCE_DIR="$TEMP_ROOT/dotfiles"
+}
+
+clone_repository() {
+    local clone_args=(git clone --depth 1)
+
+    if [[ -n "$REF" ]]; then
+        clone_args+=(--branch "$REF")
+    fi
+
+    clone_args+=("$REPOSITORY" "$SOURCE_DIR")
+    run "${clone_args[@]}"
+
+    if [[ "$DRY_RUN" == false && ! -d "$SOURCE_DIR/modules" ]]; then
+        printf '%s\n' 'The repository does not contain modules/.' >&2
+        return 1
+    fi
+}
+
+# --- Configuration helpers ---
+configure_destination_paths() {
+    CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+    DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+    STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+    BACKUP_ROOT="$STATE_HOME/work-dotfiles/backup/$(date +%Y%m%d-%H%M%S)"
+}
+
+install_path() {
+    local source="$1"
+    local destination="$2"
+    local backup
+
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        if [[ "$FORCE" == false ]]; then
+            printf 'Refusing to overwrite existing %s (rerun with --force to back it up first).\n' "$destination" >&2
+            return 1
+        fi
+
+        backup="$BACKUP_ROOT${destination#"$HOME"}"
+        run mkdir -p "$(dirname "$backup")"
+        run mv "$destination" "$backup"
+    fi
+
+    run mkdir -p "$(dirname "$destination")"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        run cp -pPR "$source" "$destination"
+    else
+        run cp -a -- "$source" "$destination"
+    fi
+}
+
+install_work_configuration() {
+    install_path "$SOURCE_DIR/modules/zsh/.zshrc" "$HOME/.zshrc"
+    install_path "$SOURCE_DIR/modules/zsh/.zsh_plugins.txt" "$HOME/.zsh_plugins.txt"
+
+    install_path "$SOURCE_DIR/modules/tmux/.tmux.conf" "$HOME/.tmux.conf"
+    install_path "$SOURCE_DIR/modules/tmux/.config/tmux-sessionizer" "$CONFIG_HOME/tmux-sessionizer"
+    install_path "$SOURCE_DIR/modules/tmux/.local/bin/tmux-sessionizer" "$HOME/.local/bin/tmux-sessionizer"
+    run chmod 755 "$HOME/.local/bin/tmux-sessionizer"
+
+    install_path "$SOURCE_DIR/modules/nvim/.config/nvim" "$CONFIG_HOME/nvim"
+}
+
+# --- Plugin installers ---
+install_declared_plugins() {
+    local tmux_config="$HOME/.tmux.conf"
+    local tpm_dir="$HOME/.tmux/plugins/tpm"
+    local antidote_dir="$HOME/.antidote"
+    local lazy_dir="$DATA_HOME/nvim/lazy/lazy.nvim"
+
+    if [[ ! -d "$antidote_dir" ]]; then
+        run git clone --depth 1 https://github.com/mattmc3/antidote.git "$antidote_dir"
+    fi
+
+    if [[ ! -d "$lazy_dir" ]]; then
+        run mkdir -p "$(dirname "$lazy_dir")"
+        run git clone --depth 1 --branch stable https://github.com/folke/lazy.nvim.git "$lazy_dir"
+    fi
+
+    if [[ -f "$tmux_config" ]] && grep -qE "^[[:space:]]*set(-option)?[[:space:]].*@plugin" "$tmux_config"; then
+        if [[ ! -d "$tpm_dir" ]]; then
+            run mkdir -p "$(dirname "$tpm_dir")"
+            run git clone --depth 1 https://github.com/tmux-plugins/tpm "$tpm_dir"
+        fi
+        run "$tpm_dir/bin/install_plugins"
+    fi
+
+    printf '%s\n' 'Open a new zsh session and start Neovim to install their declared plugins.'
+}
+
+# --- Parse arguments ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --plugins)
+            INSTALL_PLUGINS=true
+            ;;
+        --optional-tools)
+            INSTALL_OPTIONAL_TOOLS=true
+            ;;
+        --force)
+            FORCE=true
+            ;;
+        --ref)
+            [[ $# -ge 2 ]] || { printf '%s\n' '--ref requires a value' >&2; exit 1; }
+            REF="$2"
+            shift
+            ;;
+        --repo)
+            [[ $# -ge 2 ]] || { printf '%s\n' '--repo requires a value' >&2; exit 1; }
+            REPOSITORY="$2"
+            shift
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n' "$1" >&2
+            print_usage >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# --- Prepare installation ---
+trap cleanup EXIT INT TERM
+prepare_temporary_clone
+configure_destination_paths
+
+# --- Install flow ---
+print_script_info
+
+install_required_tools
+
+if [[ "$INSTALL_OPTIONAL_TOOLS" == true ]]; then
+    install_optional_tools
+fi
+
+clone_repository
+install_work_configuration
+
+if [[ "$INSTALL_PLUGINS" == true ]]; then
+    install_declared_plugins
+fi
+
+printf '%s\n' 'Work configuration installed. The temporary clone has been removed.'
+if [[ "$FORCE" == true ]]; then
+    printf 'Any replaced configuration was backed up under %s.\n' "$BACKUP_ROOT"
+fi
